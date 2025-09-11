@@ -341,7 +341,11 @@ func (s *Server) GetAppDetails(ctx context.Context, q *repositorypkg.RepoAppDeta
 	if err := s.enf.EnforceErr(claims, rbac.ResourceRepositories, rbac.ActionGet, createRBACObject(repo.Project, repo.Repo)); err != nil {
 		return nil, err
 	}
-	appName, appNs := argo.ParseFromQualifiedName(q.AppName, s.settings.GetNamespace())
+	appNamespace := s.settings.GetNamespace()
+	if q.AppNamespace != "" {
+		appNamespace = q.AppNamespace
+	}
+	appName, appNs := argo.ParseFromQualifiedName(q.AppName, appNamespace)
 	app, err := s.appLister.Applications(appNs).Get(appName)
 	appRBACObj := createRBACObject(q.AppProject, q.AppName)
 	// ensure caller has read privileges to app
