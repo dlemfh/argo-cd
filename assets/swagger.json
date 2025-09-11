@@ -6024,6 +6024,10 @@
         "appName": {
           "type": "string"
         },
+        "appNamespace": {
+          "type": "string",
+          "title": "app namespace (for apps in any namespace)"
+        },
         "appProject": {
           "type": "string"
         },
