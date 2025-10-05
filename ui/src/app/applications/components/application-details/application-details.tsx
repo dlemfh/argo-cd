@@ -276,7 +276,9 @@ Are you sure you want to disable auto-sync and rollback application '${props.mat
                 if (confirmed) {
                     if (needDisableRollback) {
                         const update = JSON.parse(JSON.stringify(application)) as appModels.Application;
-                        update.spec.syncPolicy.automated = null;
+                        if (update.spec.syncPolicy.automated) {
+                            update.spec.syncPolicy.automated.enabled = false;
+                        }
                         await services.applications.update(update, {validate: false});
                     }
                     await services.applications.rollback(props.match.params.name, getAppNamespace(), revisionHistory.id);
