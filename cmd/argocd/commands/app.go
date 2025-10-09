@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"sort"
@@ -3129,6 +3130,7 @@ func NewApplicationManifestsCommand(clientOpts *argocdclient.ClientOptions) *cob
 		sourceNames     []string
 		local           string
 		localRepoRoot   string
+		offline         bool
 	)
 	command := &cobra.Command{
 		Use:   "manifests APPNAME",
@@ -3145,7 +3147,17 @@ func NewApplicationManifestsCommand(clientOpts *argocdclient.ClientOptions) *cob
 
   # Get manifests for a multi-source application at specific revisions for specific sources
   argocd app manifests my-app --revisions 0.0.1 --source-positions 1 --revisions 0.0.2 --source-positions 2
-  		`),
+
+  # Render manifests offline from a local Application YAML file
+  argocd app manifests ./application.yaml --offline
+  argocd app manifests /path/to/application.yaml --offline
+
+  # Render manifests offline from stdin
+  cat application.yaml | argocd app manifests - --offline
+
+  # Render manifests offline for an application that exists on the server
+  argocd app manifests my-app --offline
+		`),
 		Run: func(c *cobra.Command, args []string) {
 			ctx := c.Context()
 
@@ -3172,16 +3184,52 @@ func NewApplicationManifestsCommand(clientOpts *argocdclient.ClientOptions) *cob
 				}
 			}
 
-			appName, appNs := argo.ParseFromQualifiedName(args[0], "")
-			clientset := headless.NewClientOrDie(clientOpts, c)
-			conn, appIf := clientset.NewApplicationClientOrDie()
-			defer utilio.Close(conn)
+			appNameOrPath := args[0]
 
-			app, err := appIf.Get(context.Background(), &application.ApplicationQuery{
-				Name:         &appName,
-				AppNamespace: &appNs,
-			})
-			errors.CheckError(err)
+			var app *argoappv1.Application
+			var err error
+
+			// Check if the argument is a file path (starts with ., /, or is "-" for stdin)
+			// Kubernetes resource names cannot start with ".", so any argument starting with "." is a file path
+			isFilePath := strings.HasPrefix(appNameOrPath, ".") ||
+				strings.HasPrefix(appNameOrPath, "/") ||
+				appNameOrPath == "-"
+
+			// Get Application spec from file or server
+			if isFilePath {
+				var appYAML []byte
+				if appNameOrPath == "-" {
+					appYAML, err = io.ReadAll(os.Stdin)
+				} else {
+					appYAML, err = os.ReadFile(appNameOrPath)
+				}
+				errors.CheckError(err)
+
+				// Parse Application YAML
+				var appObj argoappv1.Application
+				err = yaml.Unmarshal(appYAML, &appObj)
+				errors.CheckError(err)
+
+				// Set the application name if not specified
+				if appObj.Name == "" {
+					// Use filename without extension as app name
+					appObj.Name = strings.TrimSuffix(filepath.Base(appNameOrPath), filepath.Ext(appNameOrPath))
+				}
+				app = &appObj
+			} else {
+				// Get Application spec from ArgoCD server
+				appName, appNs := argo.ParseFromQualifiedName(appNameOrPath, "")
+				clientset := headless.NewClientOrDie(clientOpts, c)
+				conn, appIf := clientset.NewApplicationClientOrDie()
+				defer utilio.Close(conn)
+
+				appObj, err := appIf.Get(context.Background(), &application.ApplicationQuery{
+					Name:         &appName,
+					AppNamespace: &appNs,
+				})
+				errors.CheckError(err)
+				app = appObj
+			}
 
 			if len(sourceNames) > 0 {
 				sourceNameToPosition := getSourceNameToPositionMap(app)
@@ -3195,71 +3243,97 @@ func NewApplicationManifestsCommand(clientOpts *argocdclient.ClientOptions) *cob
 				}
 			}
 
-			resources, err := appIf.ManagedResources(ctx, &application.ResourcesQuery{
-				ApplicationName: &appName,
-				AppNamespace:    &appNs,
-			})
-			errors.CheckError(err)
-
 			var unstructureds []*unstructured.Unstructured
-			switch source {
-			case "git":
-				switch {
-				case local != "":
-					settingsConn, settingsIf := clientset.NewSettingsClientOrDie()
-					defer utilio.Close(settingsConn)
-					argoSettings, err := settingsIf.Get(context.Background(), &settings.SettingsQuery{})
-					errors.CheckError(err)
 
-					clusterConn, clusterIf := clientset.NewClusterClientOrDie()
-					defer utilio.Close(clusterConn)
-					cluster, err := clusterIf.Get(context.Background(), &clusterpkg.ClusterQuery{Name: app.Spec.Destination.Name, Server: app.Spec.Destination.Server})
-					errors.CheckError(err)
-
-					proj := getProject(ctx, c, clientOpts, app.Spec.Project)
-					//nolint:staticcheck
-					unstructureds = getLocalObjects(context.Background(), app, proj.Project, local, localRepoRoot, argoSettings.AppLabelKey, cluster.ServerVersion, cluster.Info.APIVersions, argoSettings.KustomizeOptions, argoSettings.TrackingMethod)
-				case len(revisions) > 0 && len(sourcePositions) > 0:
-					q := application.ApplicationManifestQuery{
-						Name:            &appName,
-						AppNamespace:    &appNs,
-						Revision:        ptr.To(revision),
-						Revisions:       revisions,
-						SourcePositions: sourcePositions,
-					}
-					res, err := appIf.GetManifests(ctx, &q)
-					errors.CheckError(err)
-
-					for _, mfst := range res.Manifests {
-						obj, err := argoappv1.UnmarshalToUnstructured(mfst)
-						errors.CheckError(err)
-						unstructureds = append(unstructureds, obj)
-					}
-				case revision != "":
-					q := application.ApplicationManifestQuery{
-						Name:         &appName,
-						AppNamespace: &appNs,
-						Revision:     ptr.To(revision),
-					}
-					res, err := appIf.GetManifests(ctx, &q)
-					errors.CheckError(err)
-
-					for _, mfst := range res.Manifests {
-						obj, err := argoappv1.UnmarshalToUnstructured(mfst)
-						errors.CheckError(err)
-						unstructureds = append(unstructureds, obj)
-					}
-				default:
-					targetObjs, err := targetObjects(resources.Items)
-					errors.CheckError(err)
-					unstructureds = targetObjs
+			// Choose rendering method based on --offline flag
+			if offline {
+				// For offline rendering, we only support git source
+				if source != "git" && source != "" {
+					log.Fatalf("Offline rendering only supports git source, got: %s", source)
 				}
-			case "live":
-				liveObjs, err := cmdutil.LiveObjects(resources.Items)
+
+				// Render manifests offline
+				manifests, err := renderApplicationOffline(ctx, app, clientOpts, c)
 				errors.CheckError(err)
-				unstructureds = liveObjs
-			default:
-				log.Fatalf("Unknown source type '%s'", source)
+
+				// Convert manifest strings to unstructured objects
+				for _, manifest := range manifests {
+					obj, err := argoappv1.UnmarshalToUnstructured(manifest)
+					errors.CheckError(err)
+					unstructureds = append(unstructureds, obj)
+				}
+			} else {
+				// Online rendering - connect to ArgoCD server
+				appName, appNs := argo.ParseFromQualifiedName(appNameOrPath, "")
+				clientset := headless.NewClientOrDie(clientOpts, c)
+				conn, appIf := clientset.NewApplicationClientOrDie()
+				defer utilio.Close(conn)
+
+				resources, err := appIf.ManagedResources(ctx, &application.ResourcesQuery{
+					ApplicationName: &appName,
+					AppNamespace:    &appNs,
+				})
+				errors.CheckError(err)
+
+				switch source {
+				case "git":
+					switch {
+					case local != "":
+						settingsConn, settingsIf := clientset.NewSettingsClientOrDie()
+						defer utilio.Close(settingsConn)
+						argoSettings, err := settingsIf.Get(context.Background(), &settings.SettingsQuery{})
+						errors.CheckError(err)
+
+						clusterConn, clusterIf := clientset.NewClusterClientOrDie()
+						defer utilio.Close(clusterConn)
+						cluster, err := clusterIf.Get(context.Background(), &clusterpkg.ClusterQuery{Name: app.Spec.Destination.Name, Server: app.Spec.Destination.Server})
+						errors.CheckError(err)
+
+						proj := getProject(ctx, c, clientOpts, app.Spec.Project)
+						//nolint:staticcheck
+						unstructureds = getLocalObjects(context.Background(), app, proj.Project, local, localRepoRoot, argoSettings.AppLabelKey, cluster.ServerVersion, cluster.Info.APIVersions, argoSettings.KustomizeOptions, argoSettings.TrackingMethod, argoSettings.ControllerNamespace)
+					case len(revisions) > 0 && len(sourcePositions) > 0:
+						q := application.ApplicationManifestQuery{
+							Name:            &appName,
+							AppNamespace:    &appNs,
+							Revision:        ptr.To(revision),
+							Revisions:       revisions,
+							SourcePositions: sourcePositions,
+						}
+						res, err := appIf.GetManifests(ctx, &q)
+						errors.CheckError(err)
+
+						for _, mfst := range res.Manifests {
+							obj, err := argoappv1.UnmarshalToUnstructured(mfst)
+							errors.CheckError(err)
+							unstructureds = append(unstructureds, obj)
+						}
+					case revision != "":
+						q := application.ApplicationManifestQuery{
+							Name:         &appName,
+							AppNamespace: &appNs,
+							Revision:     ptr.To(revision),
+						}
+						res, err := appIf.GetManifests(ctx, &q)
+						errors.CheckError(err)
+
+						for _, mfst := range res.Manifests {
+							obj, err := argoappv1.UnmarshalToUnstructured(mfst)
+							errors.CheckError(err)
+							unstructureds = append(unstructureds, obj)
+						}
+					default:
+						targetObjs, err := targetObjects(resources.Items)
+						errors.CheckError(err)
+						unstructureds = targetObjs
+					}
+				case "live":
+					liveObjs, err := cmdutil.LiveObjects(resources.Items)
+					errors.CheckError(err)
+					unstructureds = liveObjs
+				default:
+					log.Fatalf("Unknown source type '%s'", source)
+				}
 			}
 
 			for _, obj := range unstructureds {
@@ -3277,6 +3351,7 @@ func NewApplicationManifestsCommand(clientOpts *argocdclient.ClientOptions) *cob
 	command.Flags().StringArrayVar(&sourceNames, "source-names", []string{}, "List of source names. Default is an empty array.")
 	command.Flags().StringVar(&local, "local", "", "If set, show locally-generated manifests. Value is the absolute path to app manifests within the manifest repo. Example: '/home/username/apps/env/app-1'.")
 	command.Flags().StringVar(&localRepoRoot, "local-repo-root", ".", "Path to the local repository root. Used together with --local allows setting the repository root. Example: '/home/username/apps'.")
+	command.Flags().BoolVar(&offline, "offline", false, "Render manifests offline without connecting to ArgoCD server. Requires the repository to be cloned locally.")
 	return command
 }
 
@@ -3668,4 +3743,87 @@ func prepareObjectsForDiff(ctx context.Context, app *argoappv1.Application, proj
 	}
 
 	return items, nil
+}
+
+// renderApplicationOffline renders an Application's manifests offline without connecting to ArgoCD server
+func renderApplicationOffline(ctx context.Context, app *argoappv1.Application, clientOpts *argocdclient.ClientOptions, c *cobra.Command) ([]string, error) {
+	// Get default project if not specified
+	projectName := app.Spec.Project
+	if projectName == "" {
+		projectName = "default"
+	}
+
+	// Create a default project for offline rendering
+	proj := &argoappv1.AppProject{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: projectName,
+		},
+		Spec: argoappv1.AppProjectSpec{
+			SourceRepos: []string{"*"},
+			Destinations: []argoappv1.ApplicationDestination{
+				{
+					Namespace: "*",
+					Server:    "*",
+				},
+			},
+		},
+	}
+
+	// Get source from application
+	source := app.Spec.GetSource()
+	if source.RepoURL == "" {
+		return nil, fmt.Errorf("application source repoURL is required for offline rendering")
+	}
+
+	// Get current working directory as the repository root
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current working directory: %w", err)
+	}
+
+	// Get the app path within the current directory
+	appPath := filepath.Join(repoRoot, source.Path)
+
+	// Verify the app path exists
+	if _, err := os.Stat(appPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("application path does not exist: %s", appPath)
+	}
+
+	// Get ArgoCD settings to retrieve controller namespace
+	clientset := headless.NewClientOrDie(clientOpts, c)
+	settingsConn, settingsIf := clientset.NewSettingsClientOrDie()
+	defer utilio.Close(settingsConn)
+	argoSettings, err := settingsIf.Get(ctx, &settings.SettingsQuery{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ArgoCD settings: %w", err)
+	}
+
+	// Create repository object
+	repo := &argoappv1.Repository{
+		Repo: source.RepoURL,
+	}
+
+	// Use the repository.GenerateManifests function for offline rendering
+	manifestRequest := &repoapiclient.ManifestRequest{
+		Repo:                            repo,
+		AppLabelKey:                     "app.kubernetes.io/name",
+		AppName:                         app.InstanceName(argoSettings.ControllerNamespace), // Use InstanceName with controller namespace from settings
+		Namespace:                       app.Spec.Destination.Namespace,
+		ApplicationSource:               &source,
+		KustomizeOptions:                &argoappv1.KustomizeOptions{},
+		KubeVersion:                     "v1.28.0", // Default kube version
+		ApiVersions:                     []string{},
+		TrackingMethod:                  "annotation",
+		ProjectName:                     proj.Name,
+		ProjectSourceRepos:              proj.Spec.SourceRepos,
+		AnnotationManifestGeneratePaths: app.GetAnnotation(argoappv1.AnnotationKeyManifestGeneratePaths),
+	}
+
+	// Generate manifests using the repository service
+	res, err := repository.GenerateManifests(ctx, appPath, repoRoot, source.TargetRevision, manifestRequest, true, &git.NoopCredsStore{}, resource.MustParse("0"), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate manifests: %w", err)
+	}
+
+	return res.Manifests, nil
 }
